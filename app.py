@@ -1,117 +1,334 @@
-import threading
-from configparser import ConfigParser
-import glob
-import random
-import re
-import pandas as pd
-import requests
-import time
+import logging
+import eventlet
+
+import signal
 import os
 import shutil
-import zipfile
-from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, AudioFileClip, ColorClip, concatenate_videoclips
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+import threading
+import pandas as pd
+import glob
+import re
+import requests
+from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, AudioFileClip, ColorClip, concatenate_videoclips
 from tqdm import tqdm
-from elevenlabs.client import ElevenLabs
-from traitlets import Bool
-from dependencies.fonts import font_exists, install_fonts
-from dependencies.imagemagick import install_imagemagick, is_imagemagick_installed
-from moviepy.video.fx.all import crop
-from dependencies.voices import VOICE_SETTINGS
 from datetime import datetime
+from moviepy.video.fx.all import crop
 import csv
+import zipfile
+from threading import Lock
 
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-global VOICES
-global DEV_MODE
+upload_tasks = {}
+tasks_lock = Lock()
+process_pids = {}
+canceled_tasks = set()
+
 start_time = datetime.now()
 
-# region Variables config
-# ! Edit voices here
-VOICES = [
-    "Bradley - Formal and Serious",
-    "Drew",
-]
+def delete_files():
+    try:
+        input_dir = 'input'
+        output_dir = 'output'
+        if os.path.exists(input_dir):
+            shutil.rmtree(input_dir)
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(os.path.join(input_dir, 'video'), exist_ok=True)
+        os.makedirs(os.path.join(input_dir, 'scripts'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'audios'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'videos'), exist_ok=True)
+        print("All files deleted successfully.")
+    except Exception as e:
+        print(f"Error deleting files: {str(e)}")
 
-# ! Script videos OUTPUT dir
-# get desktop dir macos or windows whatever is os
-if os.name == 'nt':
-    SCRIPTS_OUTPUT_DIR = os.path.join(os.environ['USERPROFILE'], 'Desktop')
-else:
-    SCRIPTS_OUTPUT_DIR = os.path.join(os.environ['HOME'], 'Desktop')
+@app.route('/process', methods=['POST'])
+def process_endpoint():
+    delete_files()
+    return process_files()
 
-# endregion
+def process_files():
+    script_file = request.files.get('script')
+    video_files = request.files.getlist('video')
+    input_csv_file = request.files.get('input_csv')
+    voice_id = request.form.get('voice_id')
+    api_key = request.form.get('api_key')
+    parallel_processing = request.form.get('parallel_processing')
+    task_id = request.form.get('task_id')
 
-# region Loading config and setting things up
-config_file = os.path.abspath('./dev_mode.ini' if os.path.exists('./dev_mode.ini') else './config.ini')
-config = ConfigParser()
-config.read(config_file)
+    # Log received parameters
+    print("Received parameters:")
+    print(f"script_file: {script_file}")
+    print(f"video_files: {video_files}")
+    print(f"input_csv_file: {input_csv_file}")
+    print(f"voice_id: {voice_id}")
+    print(f"api_key: {api_key}")
+    print(f"parallel_processing: {parallel_processing}")
+    print(f"task_id: {task_id}")
 
-no_of_parallel_executions = config.get('Setup', 'no_of_parallel_executions', fallback=20)
+    if not script_file or not video_files or not input_csv_file or not voice_id or not api_key or not parallel_processing:
+        return jsonify({"error": "Missing form data"}), 400
 
-ELEVENLABS_API_KEY = config.get('Setup', 'elevenlabs_api_key', fallback=None)
-if not ELEVENLABS_API_KEY:
-    raise ValueError("elevenlabs_api_key not set")
-else:
-    client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-# BATCH_SIZE = int(config.get('Setup', 'batch_size', fallback='100'))
+    input_dir = 'input'
+    output_dir = 'output'
+    input_videos_folder = os.path.join(input_dir, 'video')
+    input_scripts_folder = os.path.join(input_dir, 'scripts')
+    output_audios_folder = os.path.join(output_dir, 'audios')
+    output_videos_folder = os.path.join(output_dir, 'videos')
 
-INPUT_DIR = config.get('Setup', 'input_dir', fallback='input')
-INPUT_FILE = config.get('Setup', 'input_hooks_csv', fallback='hooks.csv')
-INPUT_FILE = os.path.join(INPUT_DIR, INPUT_FILE)
+    os.makedirs(input_videos_folder, exist_ok=True)
+    os.makedirs(input_scripts_folder, exist_ok=True)
+    os.makedirs(output_audios_folder, exist_ok=True)
+    os.makedirs(output_videos_folder, exist_ok=True)
 
-OUTPUT_DIR = config.get('Setup', 'output_dir', fallback='output')
-OUTPUT_FILE = config.get('Setup', 'output_file', fallback='final_results.csv')
+    script_file_path = os.path.join(input_scripts_folder, script_file.filename)
+    script_file.save(script_file_path)
 
-output_audios_folder = os.path.join(OUTPUT_DIR, 'audios')
-output_videos_folder = os.path.join(OUTPUT_DIR, 'videos')
-input_videos_folder = os.path.join(INPUT_DIR, 'video')
-input_scripts_folder = os.path.join(INPUT_DIR, 'scripts')
+    video_files_paths = []
+    for video_file in video_files:
+        video_file_path = os.path.join(input_videos_folder, video_file.filename)
+        video_file.save(video_file_path)
+        video_files_paths.append(video_file_path)
 
-OUT_VIDEO_DIM = config.get('Setup', 'output_video_dimensions', fallback='720x900')
-OUT_VIDEO_HEIGHT = int(OUT_VIDEO_DIM.split('x')[1])
-OUT_VIDEO_WIDTH = int(OUT_VIDEO_DIM.split('x')[0])
+    input_csv_file_path = os.path.join(input_dir, input_csv_file.filename)
+    input_csv_file.save(input_csv_file_path)
 
-DEV_MODE = True if config.get('Setup', 'dev_mode', fallback='false').lower() == 'true' else False
+    # Log saved files
+    print("Saved files:")
+    print(f"script_file_path: {script_file_path}")
+    print(f"video_files_paths: {video_files_paths}")
+    print(f"input_csv_file_path: {input_csv_file_path}")
 
-if not is_imagemagick_installed():
-    install_imagemagick()
-    exit(1)
-else:
-    print("ImageMagick is installed.")
+    params = {
+        "input_dir": input_dir,
+        "output_dir": output_dir,
+        "script_file_path": script_file_path,
+        "video_files_paths": video_files_paths,
+        "input_csv_file_path": input_csv_file_path,
+        "voice_id": voice_id,
+        "api_key": api_key,
+        "parallel_processing": parallel_processing,
+        "task_id": task_id
+    }
 
-if not font_exists('mu.otf'):
-    print("Installing fonts...")
-    install_fonts()
+    return process(params)
 
+def process(params):
+    global ELEVENLABS_API_KEY, no_of_parallel_executions
 
-def split_hook_text(hook_text):
-    words = hook_text.split()
-    hook_text = ' '.join(word.capitalize() for word in words)
-    if ' - ' in hook_text:
-        last_dash_index = hook_text.rfind('-')
-        line1 = hook_text[:last_dash_index].strip()
-        line2 = hook_text[last_dash_index + 1:].strip()
-    else:
-        line1 = hook_text
-        line2 = ' Second LINE IS MISSING '
-    return [line1, line2]
+    ELEVENLABS_API_KEY = params['api_key']
+    no_of_parallel_executions = params['parallel_processing']
 
+    INPUT_DIR = params['input_dir']
+    INPUT_FILE = params['input_csv_file_path']
+    OUTPUT_DIR = params['output_dir']
+    voice_id = params['voice_id']
+    task_id = params['task_id']
 
-def cleanup_temp_files():
-    for f in glob.glob("*temp*.mp3"):
-        print("Removing temp file: " + f)
-        os.remove(f)
+    input_videos_folder = os.path.join(INPUT_DIR, 'video')
+    input_scripts_folder = os.path.join(INPUT_DIR, 'scripts')
+    output_audios_folder = os.path.join(OUTPUT_DIR, 'audios')
+    output_videos_folder = os.path.join(OUTPUT_DIR, 'videos')
 
+    OUT_VIDEO_DIM = '720x900'
+    OUT_VIDEO_HEIGHT = int(OUT_VIDEO_DIM.split('x')[1])
+    OUT_VIDEO_WIDTH = int(OUT_VIDEO_DIM.split('x')[0])
 
-def create_custom_text_clip(hook_text):
+    SCRIPTS_OUTPUT_DIR = os.path.join(os.getcwd(), 'static', 'output_root', 'final')
+    os.makedirs(SCRIPTS_OUTPUT_DIR, exist_ok=True)
+
+    if not os.path.exists(INPUT_FILE):
+        raise Exception(f"Input file {INPUT_FILE} does not exist")
+
+    if len(os.listdir(input_videos_folder)) == 0:
+        raise Exception(f"input/videos folder {input_videos_folder} does not contain any videos")
+
+    video_files = sorted([f for f in os.listdir(input_videos_folder) if f.endswith('.mp4')])
+
+    input_df = pd.read_csv(INPUT_FILE)
+    for col in ["Hook Video Filename", "Input Video Filename", "Audio Filename", "Voice"]:
+        if col not in input_df.columns:
+            input_df[col] = ''
+    input_df = input_df[input_df['Hook Text'] != '']
+    input_df = input_df.fillna('')
+
+    l_unprocessed_rows = len(input_df[input_df['Hook Video Filename'] == ''])
+    if l_unprocessed_rows == 0:
+        print("No unprocessed rows found in csv file.")
+
+    all_hooks = []
+
+    total_rows = len(input_df)
+    current_row = 0
+
+    for idx_1, row in tqdm(input_df.iterrows(), total=total_rows, desc="Processing rows"):
+        hook_text = row['Hook Text']
+        hook_number = idx_1 + 1
+
+        process_audios(ELEVENLABS_API_KEY, row, hook_number, hook_text, input_df, idx_1, output_audios_folder, INPUT_FILE, voice_id)
+
+        current_row += 1
+        progress = (current_row / total_rows) * 100
+        socketio.emit('progress', {'task_id': task_id, 'progress': progress, 'step': f"{current_row}/{total_rows}"})
+
+    current_thread_count = 0
+    for idx, row in tqdm(input_df.iterrows(), total=total_rows, desc="Processing rows"):
+        hook_text = row['Hook Text']
+        hook_number = idx + 1
+
+        if row['Hook Video Filename'] != '' and os.path.exists(os.path.join(output_videos_folder, row['Hook Video Filename'])):
+            continue
+
+        audio_clip = AudioFileClip(os.path.join(output_audios_folder, row['Audio Filename']))
+        video_index = idx % len(video_files)
+        num_videos_to_use = int(round(audio_clip.duration / 2))
+
+        video_file_size = len(video_files)
+        if num_videos_to_use + video_index > video_file_size:
+            num_videos_to_use = video_file_size - video_index
+
+        last_video = video_index + num_videos_to_use
+        video_files_to_use = video_files[video_index:last_video]
+
+        hook_job = threading.Thread(target=process_audio_on_videos, args=(row, video_files_to_use, idx, input_df, hook_number, hook_text, num_videos_to_use, audio_clip, OUT_VIDEO_WIDTH, OUT_VIDEO_HEIGHT, output_videos_folder, INPUT_FILE))
+        hook_job.start()
+        all_hooks.append(hook_job)
+        current_thread_count += 1
+        if current_thread_count == int(no_of_parallel_executions):
+            for hook in all_hooks:
+                hook.join()
+            all_hooks.clear()
+            current_thread_count = 0
+        else:
+            all_hooks.append(hook_job)
+
+        current_row += 1
+        progress = (current_row / total_rows) * 100
+        socketio.emit('progress', {'task_id': task_id, 'progress': progress, 'step': f"{current_row}/{total_rows}"})
+
+    for hook in all_hooks:
+        hook.join()
+
+    script_files = sorted([f for f in os.listdir(input_scripts_folder) if f.endswith('.mp4')])
+    hook_files = sorted([f for f in os.listdir(output_videos_folder) if f.endswith('.mp4')])
+
+    current_thread_count = 0
+    for idx, script in enumerate(script_files):
+        for idy, hook in enumerate(tqdm(hook_files, desc=f"Processing Script {idx + 1} hooks")):
+            hook_script_filename = f"{os.path.splitext(hook)[0]}_{os.path.splitext(script)[0]}.mp4".replace(" ", "_")
+            temp_filename = os.path.join(SCRIPTS_OUTPUT_DIR, f"temp_{idx}_{idy}.mp4")
+            final_filename = os.path.join(SCRIPTS_OUTPUT_DIR, hook_script_filename)
+            if os.path.isfile(final_filename):
+                continue
+
+            hook_job = threading.Thread(target=process_script_file, args=(hook, script, temp_filename, final_filename, idy, idx, output_videos_folder, OUT_VIDEO_WIDTH, OUT_VIDEO_HEIGHT))
+            hook_job.start()
+            all_hooks.append(hook_job)
+            current_thread_count += 1
+            if current_thread_count == int(no_of_parallel_executions):
+                for hook in all_hooks:
+                    hook.join()
+                all_hooks.clear()
+                current_thread_count = 0
+            else:
+                all_hooks.append(hook_job)
+
+            current_row += 1
+            progress = (current_row / total_rows) * 100
+            socketio.emit('progress', {'task_id': task_id, 'progress': progress, 'step': f"{current_row}/{total_rows}"})
+
+    for hook in all_hooks:
+        hook.join()
+
+    calculate_total_hours(start_time)
+    zip_output_folder(OUTPUT_DIR)
+    delete_files()
+    socketio.emit('task_complete', {'task_id': task_id})
+    return send_file(os.path.join(OUTPUT_DIR, 'output.zip'), as_attachment=True)
+
+def zip_output_folder(folder_path):
+    shutil.make_archive(folder_path, 'zip', folder_path)
+
+def process_audios(api_key, row, hook_number, hook_text, input_df, idx, output_audios_folder, INPUT_FILE, voice_id):
+    if row['Audio Filename'] in (None, '') or not os.path.exists(os.path.join(output_audios_folder, row['Audio Filename'])):
+        print(f"Generating voiceover for hook {hook_number}...")
+        audio_filename = os.path.join(output_audios_folder, f'hook_{hook_number}.mp3')
+        status, voice_name = text_to_speech_file(api_key, hook_text, audio_filename, voice_id)
+        row['Voice'] = voice_name
+        row['Audio Filename'] = os.path.basename(audio_filename)
+        input_df.at[idx, 'Voice'] = voice_name
+        input_df.at[idx, 'Audio Filename'] = row['Audio Filename']
+        input_df.to_csv(INPUT_FILE, index=False, quotechar='"', quoting=csv.QUOTE_ALL, escapechar='\\')
+
+def text_to_speech_file(api_key, text: str, save_file_path: str, voice_id: str, remove_punctuation: bool = True) -> bool:
+    if remove_punctuation:
+        text = text.replace('-', ' ').replace('"', ' ').replace("'", ' ')
+        text = re.sub(r'[^\w\s]', '', text)
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+        "xi-api-key": api_key
+    }
+    data = {
+        "text": text,
+        "model_id": "eleven_monolingual_v1",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75
+        }
+    }
+
+    response = requests.post(url, json=data, headers=headers)
+
+    if response.status_code != 200:
+        raise Exception(f"API request failed with status code {response.status_code}: {response.text}")
+
+    with open(save_file_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=1024):
+            if chunk:
+                f.write(chunk)
+
+    return True, voice_id
+
+def process_audio_on_videos(row, video_files, idx, input_df, hook_number, hook_text, num_videos_to_use, audio_clip, OUT_VIDEO_WIDTH, OUT_VIDEO_HEIGHT, output_videos_folder, INPUT_FILE):
+    considered_videos = [os.path.join('input', 'video', video_files[i]) for i in range(num_videos_to_use)]
+    row['Input Video Filename'] = [os.path.basename(considered_video) for considered_video in considered_videos]
+    input_df.at[idx, 'Input Video Filename'] = row['Input Video Filename']
+    input_df.to_csv(INPUT_FILE, index=False, quotechar='"', quoting=csv.QUOTE_ALL)
+
+    each_video_duration = audio_clip.duration / num_videos_to_use
+    video_clips = []
+    for considered_vid in considered_videos:
+        video_clip = VideoFileClip(considered_vid).resize(width=OUT_VIDEO_WIDTH)
+        (w, h) = video_clip.size
+        cropped_clip = crop(video_clip.subclip(0, each_video_duration), width=OUT_VIDEO_WIDTH, height=OUT_VIDEO_HEIGHT, x_center=w / 2, y_center=h / 2)
+        video_clips.append(cropped_clip)
+
+    final_video_clip = concatenate_videoclips(video_clips)
+    custom_text_clip = create_custom_text_clip(hook_text, OUT_VIDEO_WIDTH, OUT_VIDEO_HEIGHT)
+
+    final_clip = CompositeVideoClip([
+        final_video_clip.audio_fadein(0.2).audio_fadeout(0.2),
+        final_video_clip,
+        custom_text_clip
+    ]).set_audio(audio_clip).set_duration(audio_clip.duration)
+
+    output_video_filename = os.path.join(output_videos_folder, f'hook_{idx}.mp4')
+    final_clip.write_videofile(output_video_filename, temp_audiofile=f"temp-audio_{idx}.m4a", remove_temp=True, codec='libx264', audio_codec="aac")
+
+    input_df.at[idx, 'Hook Video Filename'] = os.path.basename(output_video_filename)
+    input_df.to_csv(INPUT_FILE, index=False, quotechar='"', quoting=csv.QUOTE_ALL, escapechar='\\')
+    cleanup_temp_files()
+
+def create_custom_text_clip(hook_text, OUT_VIDEO_WIDTH, OUT_VIDEO_HEIGHT):
     hook_text = split_hook_text(hook_text)
-    print(f"hook_text: {hook_text}")
     x_multiplier = OUT_VIDEO_WIDTH / 360
     y_multiplier = OUT_VIDEO_HEIGHT / 450
     min_red_area_h = int(round(75 * y_multiplier))
@@ -167,300 +384,65 @@ def create_custom_text_clip(hook_text):
         text_clip2.set_position((x_margin, text_clip2_y_offset)),
     ], size=(OUT_VIDEO_WIDTH, OUT_VIDEO_HEIGHT))
 
-    if DEV_MODE:
-        try:
-            print("final_clip size:", final_clip.size)
-            print("bg_clip1 size:", bg_clip1.size)
-            print("bg_clip2 size:", bg_clip2.size)
-            print("text_clip1 size:", text_clip1.size)
-            print("text_clip2 size:", text_clip2.size)
-            print("bg_clip1 position at t=0:", bg_clip1.pos(0))
-            print("bg_clip2 position at t=0:", bg_clip2.pos(0))
-            print("text_clip1 position at t=0:", text_clip1.pos(0))
-            print("text_clip2 position at t=0:", text_clip2.pos(0))
-            sample_frame = final_clip.get_frame(0)
-            print("Sample frame shape:", sample_frame.shape)
-        except Exception as e:
-            print("Error during frame validation:", e)
-            input("Press Enter to continue...")
     return final_clip
 
+def split_hook_text(hook_text):
+    words = hook_text.split()
+    hook_text = ' '.join(word.capitalize() for word in words)
 
-def text_to_speech_file(text: str, save_file_path: str, remove_punctuation: bool = True) -> Bool:
-    global VOICES
-    if remove_punctuation:
-        text = text.replace('-', ' ').replace('"', ' ').replace("'", ' ')
-        text = re.sub(r'[^\w\s]', '', text)
+    if ' - ' in hook_text:
+        last_dash_index = hook_text.rfind('-')
+        line1 = hook_text[:last_dash_index].strip()
+        line2 = hook_text[last_dash_index + 1:].strip()
+    else:
+        line1 = hook_text
+        line2 = ' Second LINE IS MISSING '
+    return [line1, line2]
 
-    random_voice_name = random.choice(list(VOICES.keys()))
+def cleanup_temp_files():
+    for f in glob.glob("*temp*.mp3"):
+        os.remove(f)
 
-    response = client.text_to_speech.convert(
-        voice_id=VOICES[random_voice_name],
-        optimize_streaming_latency=2,
-        output_format="mp3_22050_32",
-        text=text,
-        model_id="eleven_turbo_v2",
-        voice_settings=VOICE_SETTINGS[random_voice_name],
-    )
+def calculate_total_hours(start_time):
+    end_time = datetime.now()
+    time_difference = end_time - start_time
+    total_seconds = time_difference.total_seconds()
+    total_hours = total_seconds / 3600
+    print(f'total_hours={total_hours}')
 
-    with open(save_file_path, "wb") as f:
-        for chunk in response:
-            if chunk:
-                f.write(chunk)
-
-    return True, random_voice_name
-
-
-def get_voices_ids(voice_names) -> dict:
-    voices_url = 'https://api.elevenlabs.io/v1/voices'
-    headers = {"xi-api-key": ELEVENLABS_API_KEY}
-    while True:
-        try:
-            response = requests.get(voices_url, headers=headers)
-            if response.status_code == 200:
-                voices_data = response.json()
-                VOICES = {}
-                for voice in voices_data['voices']:
-                    name = voice['name']
-                    voice_id = voice['voice_id']
-
-                    if name in voice_names:
-                        VOICES[name] = voice_id
-            return VOICES
-        except Exception as e:
-            print(f"Error getting voices IDs: {e}")
-            for i in reversed(range(10)):
-                print(f"Retrying in {i} seconds...", end="\r")
-                time.sleep(1)
-
-
-def process_audios(row, hook_number, hook_text, input_df, idx, voice_id):
-    if row['Audio Filename'] in (None, '') or not os.path.exists(
-            os.path.join(output_audios_folder, row['Audio Filename'])):
-        print(f"Generating voiceover for hook {hook_number}...")
-        audio_filename = os.path.join(output_audios_folder, f'hook_{hook_number}.mp3')
-        status, voice_name = text_to_speech_file(hook_text, audio_filename)
-        row['Voice'] = voice_name
-        row['Audio Filename'] = os.path.basename(os.path.join(output_audios_folder, audio_filename))
-        input_df.at[idx, 'Voice'] = voice_name
-        input_df.at[idx, 'Audio Filename'] = row['Audio Filename']
-        input_df.to_csv(INPUT_FILE, index=False, quotechar='"', quoting=csv.QUOTE_ALL, escapechar='\\')
-
-
-def process_audio_on_videos(row, video_files, idx, input_df, hook_number, hook_text, num_videos_to_use, audio_clip):
-    print('===========================')
-    print(f'idx={idx}')
-    print(f'audio_clip={audio_clip}')
-    print(f'num_videos_to_use={num_videos_to_use}')
-    print(f'video_files_to_use={video_files}')
-    print('===========================')
-
-    considered_videos = [os.path.join(input_videos_folder, video_files[i]) for i in range(num_videos_to_use)]
-    row['Input Video Filename'] = [os.path.basename(considered_video) for considered_video in considered_videos]
-    input_df.at[idx, 'Input Video Filename'] = row['Input Video Filename']
-    input_df.to_csv(INPUT_FILE, index=False, quotechar='"', quoting=csv.QUOTE_ALL)
-
-    print(f"Generating final hook {hook_number} video...")
-
-    each_video_duration = audio_clip.duration / num_videos_to_use
-    video_clips = []
-    for considered_vid in considered_videos:
-        video_clip = VideoFileClip(considered_vid).resize(width=OUT_VIDEO_WIDTH)
-        (w, h) = video_clip.size
-        cropped_clip = crop(video_clip.subclip(0, each_video_duration), width=OUT_VIDEO_WIDTH,
-                            height=OUT_VIDEO_HEIGHT, x_center=w / 2, y_center=h / 2)
-        video_clips.append(cropped_clip)
-
-    final_video_clip = concatenate_videoclips(video_clips)
-
-    custom_text_clip = create_custom_text_clip(hook_text)
-
-    final_clip = CompositeVideoClip([
-        final_video_clip.audio_fadein(0.2).audio_fadeout(0.2),
-        final_video_clip,
-        custom_text_clip
-    ]).set_audio(audio_clip).set_duration(audio_clip.duration)
-
-    output_video_filename = os.path.join(output_videos_folder, f'hook_{idx}.mp4')
-    final_clip.write_videofile(output_video_filename, temp_audiofile=f"temp-audio_{idx}.m4a", remove_temp=True,
-                               codec='libx264', audio_codec="aac")
-
-    input_df.at[idx, 'Hook Video Filename'] = os.path.basename(output_video_filename)
-    input_df.to_csv(INPUT_FILE, index=False, quotechar='"', quoting=csv.QUOTE_ALL, escapechar='\\')
-    cleanup_temp_files()
-
-
-def process_script_file(hook, script, temp_filename, final_filename, idy, idx):
+def process_script_file(hook, script, temp_filename, final_filename, idy, idx, output_videos_folder, OUT_VIDEO_WIDTH, OUT_VIDEO_HEIGHT):
     hook_clip = VideoFileClip(os.path.join(output_videos_folder, hook))
-    script_clip = VideoFileClip(os.path.join(input_scripts_folder, script)).resize(width=OUT_VIDEO_WIDTH)
+    script_clip = VideoFileClip(os.path.join('input', 'scripts', script)).resize(width=OUT_VIDEO_WIDTH)
     (w, h) = script_clip.size
     script_clip = crop(script_clip, width=OUT_VIDEO_WIDTH, height=OUT_VIDEO_HEIGHT, x_center=w / 2, y_center=h / 2)
 
     final_clip = concatenate_videoclips([hook_clip, script_clip])
-    final_clip.write_videofile(temp_filename, temp_audiofile=f"temp-audio_{idx}_{idy}.m4a", remove_temp=True,
-                               codec='libx264', audio_codec="aac")
+    final_clip.write_videofile(temp_filename, temp_audiofile=f"temp-audio_{idx}_{idy}.m4a", remove_temp=True, codec='libx264', audio_codec="aac")
 
-    print(f'<<<<<<<<<<<<<<<<<<<<<<<<<<moving {temp_filename} to  {final_filename}')
     shutil.move(temp_filename, final_filename)
 
-
-def calculate_total_hours():
+@app.route('/cancel_task', methods=['POST'])
+def cancel_task():
     try:
-        end_time = datetime.now()
-        time_difference = end_time - start_time
-        total_seconds = time_difference.total_seconds()
-        total_hours = total_seconds / 3600
-        print(f'total_hours={total_hours}')
+        task_id = request.json.get('task_id')
+        print(f"Received request to cancel task: {task_id}")
+        with tasks_lock:
+            if task_id in canceled_tasks:
+                print(f"Task {task_id} already marked for cancellation")
+            canceled_tasks.add(task_id)
+            if task_id in upload_tasks:
+                upload_tasks[task_id] = False
+                for pid in process_pids.get(task_id, []):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                process_pids.pop(task_id, None)
+                print(f"Task {task_id} set to be canceled")
+        return jsonify({"message": "Task cancellation request processed"}), 200
     except Exception as e:
-        print('issue with duration calculation')
-        print(e)
+        print(f"Error handling cancel task request: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
-
-def process(INPUT_DIR, INPUT_FILE, OUTPUT_DIR, voice_id):
-    input_videos_folder = os.path.join(INPUT_DIR, 'video')
-    input_scripts_folder = os.path.join(INPUT_DIR, 'scripts')
-    output_audios_folder = os.path.join(OUTPUT_DIR, 'audios')
-    output_videos_folder = os.path.join(OUTPUT_DIR, 'videos')
-    global VOICES
-
-    SCRIPTS_OUTPUT_DIR = os.path.join(os.getcwd(), 'static', 'output_root', 'final')
-    print(f'creating script folder path={SCRIPTS_OUTPUT_DIR}')
-    script_folder = SCRIPTS_OUTPUT_DIR
-    os.makedirs(script_folder, exist_ok=True)
-    print('script path created')
-
-    if not os.path.exists(INPUT_FILE):
-        raise Exception(f"Input file {INPUT_FILE} does not exist")
-
-    if len(os.listdir(input_videos_folder)) == 0:
-        raise Exception(f"input/videos folder {input_videos_folder} does not contain any videos")
-
-    video_files = sorted([f for f in os.listdir(input_videos_folder) if f.endswith('.mp4')])
-
-    print(f'video_files={video_files}')
-
-    input_df = pd.read_csv(INPUT_FILE)
-    for col in ["Hook Video Filename", "Input Video Filename", "Audio Filename", "Voice"]:
-        if col not in input_df.columns:
-            input_df[col] = ''
-    input_df = input_df[input_df['Hook Text'] != '']
-    input_df = input_df.fillna('')
-
-    l_unprocessed_rows = len(input_df[input_df['Hook Video Filename'] == ''])
-    if l_unprocessed_rows == 0:
-        print("No unprocessed rows found in csv file.")
-
-    print(f"Found total {len(input_df)} valid rows in csv file.")
-    print(f"Total input videos: {len(video_files)}")
-    print(f"Unprocessed rows: {l_unprocessed_rows}")
-
-    VOICES = get_voices_ids(VOICES)
-    all_hooks = []
-
-    for idx_1, row in tqdm(input_df.iterrows(), total=len(input_df), desc="Processing rows"):
-        hook_text = row['Hook Text']
-        hook_number = idx_1 + 1
-        process_audios(row, hook_number, hook_text, input_df, idx_1, voice_id)
-
-    current_thread_count = 0
-    for idx, row in tqdm(input_df.iterrows(), total=len(input_df), desc="Processing rows"):
-        hook_text = row['Hook Text']
-        hook_number = idx + 1
-
-        if row['Hook Video Filename'] != '' and os.path.exists(
-                os.path.join(output_videos_folder, row['Hook Video Filename'])):
-            continue
-
-        print('')
-        audio_clip = AudioFileClip(os.path.join(output_audios_folder, row['Audio Filename']))
-        video_index = idx % len(video_files)
-        num_videos_to_use = int(round(audio_clip.duration / 2))
-
-        video_file_size = len(video_files)
-        if num_videos_to_use + video_index > video_file_size:
-            num_videos_to_use = video_file_size - video_index
-
-        last_video = video_index + num_videos_to_use
-        video_files_to_use = video_files[video_index:last_video]
-
-        hook_job = threading.Thread(target=process_audio_on_videos, args=(row, video_files_to_use, idx, input_df, hook_number, hook_text, num_videos_to_use, audio_clip))
-        hook_job.start()
-        all_hooks.append(hook_job)
-        current_thread_count += 1
-        if current_thread_count == int(no_of_parallel_executions):
-            for hook in all_hooks:
-                hook.join()
-            all_hooks.clear()
-            current_thread_count = 0
-        else:
-            all_hooks.append(hook_job)
-
-    for hook in all_hooks:
-        hook.join()
-
-    print("Generating final output script videos...")
-
-    script_files = sorted([f for f in os.listdir(input_scripts_folder) if f.endswith('.mp4')])
-    hook_files = sorted([f for f in os.listdir(output_videos_folder) if f.endswith('.mp4')])
-
-    current_thread_count = 0
-    for idx, script in enumerate(script_files):
-        for idy, hook in enumerate(tqdm(hook_files, desc=f"Processing Script {idx + 1} hooks")):
-            hook_script_filename = f"{os.path.splitext(hook)[0]}_{os.path.splitext(script)[0]}.mp4".replace(" ", "_")
-            temp_filename = os.path.join(script_folder, f"temp_{idx}_{idy}.mp4")
-            final_filename = os.path.join(script_folder, hook_script_filename)
-            if os.path.isfile(final_filename):
-                continue
-
-            hook_job = threading.Thread(target=process_script_file,
-                                        args=(hook, script, temp_filename, final_filename, idy, idx))
-            hook_job.start()
-            all_hooks.append(hook_job)
-            current_thread_count += 1
-            if current_thread_count == int(no_of_parallel_executions):
-                for hook in all_hooks:
-                    hook.join()
-                all_hooks.clear()
-                current_thread_count = 0
-            else:
-                all_hooks.append(hook_job)
-
-        for hook in all_hooks:
-            hook.join()
-
-    calculate_total_hours()
-
-    # Create a ZIP archive of the output files
-    output_zip = os.path.join(OUTPUT_DIR, 'output_files.zip')
-    with zipfile.ZipFile(output_zip, 'w') as zipf:
-        for root, dirs, files in os.walk(OUTPUT_DIR):
-            for file in files:
-                zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), OUTPUT_DIR))
-
-    # Clean up input and output files
-    shutil.rmtree(INPUT_DIR)
-    shutil.rmtree(OUTPUT_DIR)
-
-    print('!!!!!!!!! PROCESS COMPLETED !!!!!!!!!!')
-    return output_zip
-
-
-@app.route('/process', methods=['POST'])
-def handle_process():
-    try:
-        data = request.json
-        input_dir = data['input_dir']
-        input_file = data['input_file']
-        output_dir = data['output_dir']
-        voice_id = data['voice_id']
-
-        output_zip = process(input_dir, input_file, output_dir, voice_id)
-        return send_file(output_zip, as_attachment=True)
-
-    except Exception as e:
-        print(f"Error processing request: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     socketio.run(app, debug=True, host='0.0.0.0')
