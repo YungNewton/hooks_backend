@@ -1,0 +1,9 @@
+Flask
+Flask-Cors
+Flask-SocketIO
+eventlet
+requests
+pandas
+tqdm
+moviepy
+zipfile36

@@ -229,7 +229,7 @@ def process(params):
         # Emit task completion
         socketio.emit('task_complete', {'task_id': task_id})
 
-        zip_path = OUTPUT_ZIP_PATH
+        zip_path = f"{SCRIPTS_OUTPUT_DIR}.zip"
         print(f"Debug: Path to the zip file: {zip_path}")
         if os.path.exists(zip_path):
             print("Debug: Zip file exists.")
@@ -238,7 +238,7 @@ def process(params):
                 zip_ref.printdir()
         else:
             print("Debug: Zip file does not exist!")
-
+            
     except Exception as e:
         # Emit error message
         socketio.emit('error', {'task_id': task_id, 'message': str(e)})
@@ -334,9 +334,6 @@ def process_audio_on_videos(row, video_files, idx, input_df, hook_number, hook_t
     input_df.at[idx, 'Hook Video Filename'] = os.path.basename(output_video_filename)
     input_df.to_csv(INPUT_FILE, index=False, quotechar='"', quoting=csv.QUOTE_ALL, escapechar='\\')
 
-    # Emit progress after writing output file
-    socketio.emit('progress', {'task_id': task_id, 'progress': ((idx + 1) / total_rows) * 100, 'step': f"{idx + 1}/{total_rows}"})
-
 def create_custom_text_clip(hook_text, OUT_VIDEO_WIDTH, OUT_VIDEO_HEIGHT):
     hook_text = split_hook_text(hook_text)
     x_multiplier = OUT_VIDEO_WIDTH / 360
@@ -427,8 +424,9 @@ def process_script_file(hook, script, temp_filename, final_filename, idy, idx, o
 
     shutil.move(temp_filename, final_filename)
 
-    # Emit progress after writing output file
+    # Emit progress after moving output file to the final destination
     socketio.emit('progress', {'task_id': task_id, 'progress': ((idx + 1) / total_rows) * 100, 'step': f"{idx + 1}/{total_rows}"})
+    print(f"Moved {temp_filename} to {final_filename}")
 
 @app.route('/cancel_task', methods=['POST'])
 def cancel_task():
